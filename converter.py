@@ -6,10 +6,11 @@ from datetime import datetime, timedelta
 import time
 import re
 from geopy import Point
+from geopy.distance import geodesic
 
 namespace = {'kml': 'http://www.opengis.net/kml/2.2'}
 
-def convert(kml_file, gpx_file, interval=0, date=''):
+def convert(kml_file, gpx_file, interval=0, distance_interval=0, date=''):
     tree = ET.parse(kml_file)
     root = tree.getroot()
     
@@ -39,7 +40,7 @@ def convert(kml_file, gpx_file, interval=0, date=''):
                         for point in placemark.findall('.//kml:Point', namespace):
                             for coord in point.findall('.//kml:coordinates', namespace):
                                 coords = coord.text.split(',')  # 116.534554,39.497799,792.48
-                                lon, lat, alt = coords
+                                lon, lat, alt = float(coords[0]), float(coords[1]), float(coords[2])
                                 coordinates.append((lon, lat, alt))
                                 
                         # Get bearing and speed
@@ -54,14 +55,14 @@ def convert(kml_file, gpx_file, interval=0, date=''):
                     continue
                     
     
-    print(f"Found {len(coordinates)} coordinates, {len(timestamps)} timestamps and {len(flight_data)} flight data.")
+    print(f"Found {len(coordinates)} coordinates, {len(timestamps)} timestamps.")
     
     # Track point fixer
     fixed_coordinates = []
     fixed_timestamps = []
     if interval:
         std_interval = interval  # seconds
-        for idx, (coord, time, data) in enumerate(zip(coordinates, timestamps, flight_data)):
+        for idx, (coord, time) in enumerate(zip(coordinates, timestamps)):
             fixed_coordinates.append(coord)
             fixed_timestamps.append(time)
             if idx == len(coordinates) - 1:
@@ -97,14 +98,89 @@ def convert(kml_file, gpx_file, interval=0, date=''):
                         fixed_coordinates.append((new_point[1], new_point[0], new_point[2]))
                           
         print(f"Fixed {len(fixed_coordinates)} coordinates and {len(fixed_timestamps)} timestamps.")
-        
+
     else:
         fixed_coordinates = coordinates
         fixed_timestamps = timestamps
+
+    # Distance interval resampling - resample entire trajectory with equal distance intervals
+    if distance_interval > 0 or len(fixed_coordinates) > 2:
+        # Calculate total distance of the trajectory
+        total_distance = 0
+        segment_distances = []
+        for i in range(len(fixed_coordinates) - 1):
+            current_point = (fixed_coordinates[i][1], fixed_coordinates[i][0])  # (lat, lon)
+            next_point = (fixed_coordinates[i+1][1], fixed_coordinates[i+1][0])  # (lat, lon)
+            segment_distance = geodesic(current_point, next_point).kilometers * 1000  # in meters
+            segment_distances.append(segment_distance)
+            total_distance += segment_distance
+
+        # Calculate average distance if no distance_interval specified
+        if distance_interval == 0:
+            avg_distance = total_distance / (len(fixed_coordinates) - 1)
+            distance_interval = int(avg_distance)
+            print(f"Using average distance: {distance_interval} meters")
+
+        # Calculate number of points needed (including start and end)
+        num_points = int(total_distance / distance_interval) + 1
+
+        # Resample the trajectory
+        resampled_coordinates = []
+        resampled_timestamps = []
+
+        # Start with the first point
+        resampled_coordinates.append(fixed_coordinates[0])
+        resampled_timestamps.append(fixed_timestamps[0])
+
+        current_distance = 0
+        segment_idx = 0
+        cumulative_distance = 0
+
+        for i in range(1, num_points):
+            target_distance = i * distance_interval
+
+            # Find which segment contains the target distance
+            while segment_idx < len(segment_distances) and cumulative_distance + segment_distances[segment_idx] < target_distance:
+                cumulative_distance += segment_distances[segment_idx]
+                segment_idx += 1
+
+            if segment_idx >= len(segment_distances):
+                break
+
+            # Calculate position within the current segment
+            distance_in_segment = target_distance - cumulative_distance
+            fraction = distance_in_segment / segment_distances[segment_idx]
+
+            # Get the two points of current segment
+            current_point = fixed_coordinates[segment_idx]
+            next_point = fixed_coordinates[segment_idx + 1]
+            current_time = datetime.fromisoformat(fixed_timestamps[segment_idx])
+            next_time = datetime.fromisoformat(fixed_timestamps[segment_idx + 1])
+
+            # Linear interpolation for coordinates
+            new_lat = current_point[1] + fraction * (next_point[1] - current_point[1])
+            new_lon = current_point[0] + fraction * (next_point[0] - current_point[0])
+            new_alt = current_point[2] + fraction * (next_point[2] - current_point[2])
+
+            # Linear interpolation for time
+            time_diff = (next_time - current_time).total_seconds()
+            new_time = current_time + timedelta(seconds=time_diff * fraction)
+
+            resampled_coordinates.append((new_lon, new_lat, new_alt))
+            resampled_timestamps.append(new_time.isoformat())
+
+        # Add the last point if it's not already included
+        if len(resampled_coordinates) == 0 or resampled_coordinates[-1] != fixed_coordinates[-1]:
+            resampled_coordinates.append(fixed_coordinates[-1])
+            resampled_timestamps.append(fixed_timestamps[-1])
+
+        fixed_coordinates = resampled_coordinates
+        fixed_timestamps = resampled_timestamps
+        print(f"Trajectory resampled with {distance_interval}m intervals. Final count: {len(fixed_coordinates)} points")
         
     # Date fixer
     if date:
-        date_diff = (datetime.fromisoformat(fixed_timestamps[0]) + timedelta(hours=8)).date() - datetime.strptime(date, '%Y-%m-%d').date()  # UTC+8
+        date_diff = (datetime.fromisoformat(fixed_timestamps[0]) + timedelta(hours=8)).date() - datetime.strptime(date, '%Y%m%d').date()  # UTC+8
         for idx, time in enumerate(fixed_timestamps):
             fixed_timestamps[idx] = (datetime.fromisoformat(time) - timedelta(days=date_diff.days)).isoformat()
 
@@ -140,11 +216,13 @@ def setup():
         sys.exit(1)
     gpx_file = click.prompt("Please type the desired name of the GPX file to be saved", 
                         default=os.path.splitext(kml_file)[0] + ".gpx")
-    interval = click.prompt("Please type the desired interval between track points for solving discontinuous path, if there is no need, click the ENTER.", 
+    interval = click.prompt("Please type the desired interval between track points for solving discontinuous path, if there is no need, click the ENTER.",
                         type=int, default=0)
-    date = click.prompt("Please type the desired departure date of the flight in the format 'YYYY-MM-DD' (In CST), if there is no need, click the ENTER.", 
+    distance_interval = click.prompt("Please type the desired distance interval between track points in meters (default: average distance), if there is no need, click the ENTER.",
+                        type=int, default=0)
+    date = click.prompt("Please type the desired departure date of the flight in the format 'YYYYMMDD' (In CST), if there is no need, click the ENTER.",
                         default='')
-    convert(kml_file, gpx_file, interval, date)
+    convert(kml_file, gpx_file, interval, distance_interval, date)
     print("Conversion complete.")
     time.sleep(3)
     sys.exit(0)
