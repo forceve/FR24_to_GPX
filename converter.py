@@ -1,172 +1,223 @@
-import os
-import sys
-import click
+"""Convert Flightradar24 Route KML placemarks into a GPX 1.1 track."""
+
+from __future__ import annotations
+
+import math
+import warnings
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
-import time
-import re
-from geopy import Point
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-namespace = {'kml': 'http://www.opengis.net/kml/2.2'}
+import click
 
-def convert(kml_file, gpx_file, interval=0, date=''):
-    tree = ET.parse(kml_file)
-    root = tree.getroot()
-    
-    gpx_header = '<?xml version="1.0" encoding="UTF-8"?>\n'
-    gpx_header += '<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1">\n'
+GPX_NS = "http://www.topografix.com/GPX/1/1"
+EXT_NS = "https://github.com/forceve/FR24_to_GPX/ns/1"
+CST = timezone(timedelta(hours=8))
+ET.register_namespace("", GPX_NS)
+ET.register_namespace("fr24", EXT_NS)
 
-    gpx_footer = '</gpx>'
 
-    coordinates = []
-    timestamps = []
-    # flight_data = []
+@dataclass(frozen=True)
+class TrackPoint:
+    latitude: float
+    longitude: float
+    elevation: float | None
+    timestamp: datetime
+    generated: bool = False
 
-    # Path getter
-    for document in root.findall('.//kml:Document', namespace):
-        for folder in document.findall('.//kml:Folder', namespace):
-            for name in folder.findall('.//kml:name', namespace):
-                if name.text == 'Route':
-                    for placemark in folder.findall('.//kml:Placemark', namespace):
-                        # Get timestamps
-                        for timestamp in placemark.findall('.//kml:TimeStamp', namespace):
-                            for time in timestamp.findall('.//kml:when', namespace):
-                                # iso_time = time.text  # 2025-01-10T07:10:44+00:00
-                                # gpx_time = datetime.fromisoformat(iso_time).strftime('%Y-%m-%dT%H:%M:%S.000Z')  # 2024-03-09T09:06:05.460Z
-                                timestamps.append(time.text)
-                                
-                        # Get coordinates
-                        for point in placemark.findall('.//kml:Point', namespace):
-                            for coord in point.findall('.//kml:coordinates', namespace):
-                                coords = coord.text.split(',')  # 116.534554,39.497799,792.48
-                                lon, lat, alt = coords
-                                coordinates.append((lon, lat, alt))
-                                
-                        # Get bearing and speed
-                        # for description in placemark.findall('.//kml:description', namespace):
-                        #     speed_match = re.search(r'<span><b>Speed:</b></span> <span>(\d+\.?\d*)\s*(kt|kts)</span>', description.text)
-                        #     heading_match = re.search(r'<span><b>Heading:</b></span> <span>(\d+\.?\d*)&deg;</span>', description.text)
-                        #     if speed_match and heading_match:
-                        #         speed_value, speed_unit = speed_match.groups()
-                        #         heading_value = heading_match.groups()[0] 
-                        #     flight_data.append((speed_value, heading_value))
-                else:
-                    continue
-                    
-    
-    print(f"Found {len(coordinates)} coordinates, {len(timestamps)} timestamps and {len(flight_data)} flight data.")
-    
-    # Track point fixer
-    fixed_coordinates = []
-    fixed_timestamps = []
-    if interval:
-        std_interval = interval  # seconds
-        for idx, (coord, time, data) in enumerate(zip(coordinates, timestamps, flight_data)):
-            fixed_coordinates.append(coord)
-            fixed_timestamps.append(time)
-            if idx == len(coordinates) - 1:
-                break
-            else:
-                next_time = datetime.fromisoformat(timestamps[idx+1])
-                current_time = datetime.fromisoformat(fixed_timestamps[-1])
-                time_diff = (next_time - current_time).total_seconds()
-                
-                # Heading Angle Solution
-                # while time_diff > std_interval * 1.5:
-                #     # insert a trkpt into the list
-                #     fixed_timestamps.append((current_time + timedelta(seconds=std_interval)).isoformat())
-                #     speed, bearing = data
-                #     distance = float(speed) * 1.852 * std_interval / 3600
-                #     original_point = Point(fixed_coordinates[-1][1], fixed_coordinates[-1][0])
-                #     destination = geodesic(kilometers=distance).destination(original_point, float(bearing))
-                #     fixed_coordinates.append((destination.longitude, destination.latitude, coord[2]))
-                #     current_time = datetime.fromisoformat(fixed_timestamps[-1])
-                #     time_diff = (next_time - current_time).total_seconds()
-                
-                # Time Interval Solution
-                needed_points = int(time_diff / std_interval)
-                if needed_points > 1:
-                    original_point = Point(coord[1], coord[0], coord[2])
-                    destination = Point(coordinates[idx+1][1], coordinates[idx+1][0], coordinates[idx+1][2])
-                    for i in range(1, needed_points):
-                        fixed_timestamps.append((current_time + timedelta(seconds=std_interval * i)).isoformat())
-                        fraction = i / needed_points
-                        new_point = Point(original_point[0] + fraction * (destination[0] - original_point[0]), 
-                                        original_point[1] + fraction * (destination[1] - original_point[1]), 
-                                        original_point[2] + fraction * (destination[2] - original_point[2]))
-                        fixed_coordinates.append((new_point[1], new_point[0], new_point[2]))
-                          
-        print(f"Fixed {len(fixed_coordinates)} coordinates and {len(fixed_timestamps)} timestamps.")
-        
-    else:
-        fixed_coordinates = coordinates
-        fixed_timestamps = timestamps
-        
-    # Date fixer
-    if date:
-        date_diff = (datetime.fromisoformat(fixed_timestamps[0]) + timedelta(hours=8)).date() - datetime.strptime(date, '%Y-%m-%d').date()  # UTC+8
-        for idx, time in enumerate(fixed_timestamps):
-            fixed_timestamps[idx] = (datetime.fromisoformat(time) - timedelta(days=date_diff.days)).isoformat()
 
-    
-    # GPX file writer       
-    gpx_tracks = ''
-    gpx_tracks += '<trk>\n'
-    gpx_tracks += '<trkseg>\n'
-    for coord, time in zip(fixed_coordinates, fixed_timestamps):
-        gpx_tracks += f'<trkpt lat="{coord[1]}" lon="{coord[0]}">\n'
-        gpx_tracks += f'<ele>{coord[2]}</ele>\n'
-        gpx_tracks += f'<time>{datetime.fromisoformat(time).strftime('%Y-%m-%dT%H:%M:%S.000Z')}</time>\n'
-        gpx_tracks += '</trkpt>\n'
-    gpx_tracks += '</trkseg>\n'
-    gpx_tracks += '</trk>\n'
-    
-    gpx_content = gpx_header + gpx_tracks + gpx_footer
+def _parse_time(value: str) -> datetime:
+    try:
+        result = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(f"Invalid KML timestamp: {value!r}") from exc
+    if result.tzinfo is None:
+        # A KML TimeStamp without an explicit offset is treated as UTC.
+        result = result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
 
-    with open(gpx_file, 'w') as f:
-        f.write(gpx_content)
 
-    print(f"Conversion complete. Saved to {gpx_file}")
-    
-    
-# CLI
+def read_kml(path: str | Path) -> list[TrackPoint]:
+    """Read timestamped Point placemarks inside a folder named Route."""
+    root = ET.parse(path).getroot()
+    points: list[TrackPoint] = []
+    route_folders = [
+        folder for folder in root.findall(".//{*}Folder")
+        if (folder.findtext("{*}name") or "").strip() == "Route"
+    ]
+    if not route_folders:
+        raise ValueError("No KML folder named 'Route' was found")
+
+    for folder in route_folders:
+        for placemark in folder.findall(".//{*}Placemark"):
+            time_node = placemark.find(".//{*}TimeStamp/{*}when")
+            coord_node = placemark.find(".//{*}Point/{*}coordinates")
+            if time_node is None or coord_node is None:
+                # Non-track placemarks (e.g., labels) may be included in Route.
+                continue
+            if not time_node.text or not coord_node.text:
+                raise ValueError("Empty timestamp or coordinates in Route placemark")
+            parts = coord_node.text.strip().split(",")
+            if len(parts) not in (2, 3):
+                raise ValueError(f"Invalid KML Point coordinates: {coord_node.text!r}")
+            try:
+                lon, lat = (float(item.strip()) for item in parts[:2])
+                ele = float(parts[2].strip()) if len(parts) == 3 else None
+            except ValueError as exc:
+                raise ValueError(f"Non-numeric KML coordinates: {coord_node.text!r}") from exc
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                raise ValueError(f"Out-of-range KML coordinates: {lat}, {lon}")
+            if not all(math.isfinite(x) for x in (lat, lon, *(() if ele is None else (ele,)))):
+                raise ValueError("KML coordinates must be finite")
+            points.append(TrackPoint(lat, lon, ele, _parse_time(time_node.text)))
+
+    if not points:
+        raise ValueError("The Route folder contains no timestamped Point placemarks")
+    for a, b in zip(points, points[1:]):
+        if b.timestamp <= a.timestamp:
+            raise ValueError("Route timestamps must be strictly increasing")
+    return points
+
+
+def _unit_vector(latitude: float, longitude: float) -> tuple[float, float, float]:
+    phi, lam = math.radians(latitude), math.radians(longitude)
+    return (math.cos(phi) * math.cos(lam), math.cos(phi) * math.sin(lam), math.sin(phi))
+
+
+def _great_circle(a: TrackPoint, b: TrackPoint, fraction: float) -> tuple[float, float]:
+    """Spherical linear interpolation; robust around the antimeridian."""
+    u, v = _unit_vector(a.latitude, a.longitude), _unit_vector(b.latitude, b.longitude)
+    dot = max(-1.0, min(1.0, sum(x * y for x, y in zip(u, v))))
+    omega = math.acos(dot)
+    if omega < 1e-10:
+        return a.latitude, a.longitude
+    if math.pi - omega < 1e-8:
+        raise ValueError("Cannot interpolate between antipodal coordinates")
+    sin_omega = math.sin(omega)
+    s = math.sin((1 - fraction) * omega) / sin_omega
+    t = math.sin(fraction * omega) / sin_omega
+    x, y, z = (s * u[i] + t * v[i] for i in range(3))
+    lat = math.degrees(math.atan2(z, math.hypot(x, y)))
+    lon = math.degrees(math.atan2(y, x))
+    return lat, lon
+
+
+def _distance_km(a: TrackPoint, b: TrackPoint) -> float:
+    u, v = _unit_vector(a.latitude, a.longitude), _unit_vector(b.latitude, b.longitude)
+    dot = max(-1.0, min(1.0, sum(x * y for x, y in zip(u, v))))
+    return 6371.0088 * math.acos(dot)
+
+
+def resample(points: list[TrackPoint], interval: int) -> list[TrackPoint]:
+    """Insert points at interval-second offsets in every gap, retaining observations."""
+    if interval < 0:
+        raise ValueError("Interpolation interval cannot be negative")
+    if interval == 0:
+        return list(points)
+    if not points:
+        return []
+    output = [points[0]]
+    for a, b in zip(points, points[1:]):
+        seconds = (b.timestamp - a.timestamp).total_seconds()
+        if seconds <= 0:
+            raise ValueError("Route timestamps must be strictly increasing")
+        for step in range(1, math.ceil(seconds / interval)):
+            elapsed = step * interval
+            fraction = elapsed / seconds
+            lat, lon = _great_circle(a, b, fraction)
+            elevation = (
+                a.elevation + fraction * (b.elevation - a.elevation)
+                if a.elevation is not None and b.elevation is not None else None
+            )
+            output.append(TrackPoint(lat, lon, elevation,
+                                     a.timestamp + timedelta(seconds=elapsed), True))
+        output.append(b)
+    return output
+
+
+def _warn_anomalies(points: list[TrackPoint]) -> None:
+    """Report suspicious source observations without discarding them."""
+    for a, b in zip(points, points[1:]):
+        seconds = (b.timestamp - a.timestamp).total_seconds()
+        if seconds > 1800:
+            warnings.warn(f"Large sampling gap: {seconds:.0f}s; interpolation is an estimate", stacklevel=2)
+        speed_kmh = _distance_km(a, b) * 3600 / seconds
+        if speed_kmh > 1400:
+            warnings.warn(f"Unusually high ground speed: {speed_kmh:.0f} km/h", stacklevel=2)
+
+
+def _shift_departure_date(points: list[TrackPoint], date: str) -> list[TrackPoint]:
+    if not date:
+        return points
+    try:
+        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("Departure date must be in YYYY-MM-DD format") from exc
+    local_first_date = points[0].timestamp.astimezone(CST).date()
+    delta = timedelta(days=(target_date - local_first_date).days)
+    return [replace(p, timestamp=p.timestamp + delta) for p in points]
+
+
+def write_gpx(points: list[TrackPoint], path: str | Path) -> None:
+    root = ET.Element(f"{{{GPX_NS}}}gpx", {"version": "1.1", "creator": "FR24_to_GPX"})
+    track = ET.SubElement(root, f"{{{GPX_NS}}}trk")
+    segment = ET.SubElement(track, f"{{{GPX_NS}}}trkseg")
+    for point in points:
+        trkpt = ET.SubElement(segment, f"{{{GPX_NS}}}trkpt", {
+            "lat": str(point.latitude), "lon": str(point.longitude)
+        })
+        if point.elevation is not None:
+            ET.SubElement(trkpt, f"{{{GPX_NS}}}ele").text = str(point.elevation)
+        utc_time = point.timestamp.astimezone(timezone.utc)
+        precision = ("microseconds" if utc_time.microsecond % 1000 else
+                     "milliseconds" if utc_time.microsecond else "seconds")
+        text_time = utc_time.isoformat(timespec=precision)
+        ET.SubElement(trkpt, f"{{{GPX_NS}}}time").text = text_time.replace("+00:00", "Z")
+        if point.generated:
+            extension = ET.SubElement(trkpt, f"{{{GPX_NS}}}extensions")
+            ET.SubElement(extension, f"{{{EXT_NS}}}generated").text = "true"
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def convert(kml_file: str | Path, gpx_file: str | Path,
+            interval: int = 0, date: str = "") -> tuple[int, int]:
+    """Convert one FR24 KML file, returning (original count, output count)."""
+    if interval < 0:
+        raise ValueError("Interpolation interval cannot be negative")
+    points = read_kml(kml_file)
+    points = _shift_departure_date(points, date)
+    _warn_anomalies(points)
+    output = resample(points, interval)
+    write_gpx(output, gpx_file)
+    return len(points), len(output)
+
+
 @click.command()
-def setup():
-    kml_file = click.prompt("Please enter the KML file path")
-    kml_file = re.sub(r"^.*?['\"](.*?)[\"'].*$", r"\1", kml_file)
-    if not os.path.isfile(kml_file):
-        click.echo(f"Error: {kml_file} does not exist.")
-        time.sleep(3)
-        sys.exit(1)
-    gpx_file = click.prompt("Please type the desired name of the GPX file to be saved", 
-                        default=os.path.splitext(kml_file)[0] + ".gpx")
-    interval = click.prompt("Please type the desired interval between track points for solving discontinuous path, if there is no need, click the ENTER.", 
-                        type=int, default=0)
-    date = click.prompt("Please type the desired departure date of the flight in the format 'YYYY-MM-DD' (In CST), if there is no need, click the ENTER.", 
-                        default='')
-    convert(kml_file, gpx_file, interval, date)
-    print("Conversion complete.")
-    time.sleep(3)
-    sys.exit(0)
+@click.option("--input", "kml_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--output", "gpx_file", type=click.Path(dir_okay=False, path_type=Path))
+@click.option("--interval", type=click.IntRange(min=0))
+@click.option("--date", default=None, help="Departure date in UTC+8 (YYYY-MM-DD).")
+def setup(kml_file: Path | None, gpx_file: Path | None,
+          interval: int | None, date: str | None) -> None:
+    """Convert FR24 Route KML to GPX. Missing options prompt interactively."""
+    try:
+        if kml_file is None:
+            entered = click.prompt("Please enter the KML file path").strip().strip("\"'")
+            kml_file = Path(entered)
+        if not kml_file.is_file():
+            raise click.ClickException(f"Input file does not exist: {kml_file}")
+        if gpx_file is None:
+            gpx_file = Path(click.prompt("GPX output path", default=str(kml_file.with_suffix(".gpx"))))
+        if interval is None:
+            interval = click.prompt("Interpolation interval in seconds (0 = no interpolation)", default=0, type=click.IntRange(min=0))
+        if date is None:
+            date = click.prompt("Departure date in UTC+8 (YYYY-MM-DD; blank to keep original)", default="", show_default=False)
+        original, total = convert(kml_file, gpx_file, interval, date)
+    except (ValueError, ET.ParseError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Converted {original} original points to {total} GPX points: {gpx_file}")
 
-
-# def main():
-    
-#     if len(sys.argv) < 2:
-#         print("Please drag and drop a KML file onto the application.")
-#         time.sleep(10)
-#         sys.exit(1)
-    
-#     kml_file = sys.argv[1]
-#     if not os.path.isfile(kml_file):
-#         print(f"Error: {kml_file} does not exist.")
-#         time.sleep(2)
-#         sys.exit(1)
-
-#     gpx_file = os.path.splitext(kml_file)[0] + ".gpx"
-
-#     convert(kml_file, gpx_file)
-#     time.sleep(3)
 
 if __name__ == "__main__":
     setup()
